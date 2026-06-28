@@ -10,6 +10,7 @@
 #include <esp_event.h>
 #include <esp_log.h>
 #include <esp_system.h>
+#include <esp_flash.h>
 #include <sys/param.h>
 #include <nvs_flash.h>
 
@@ -19,7 +20,11 @@
 #include "freertos/task.h"
 
 #include "esp_netif.h"
+#include "esp_chip_info.h"
 #include "ethernet_helper.h"
+#ifdef CONFIG_ETHERNET_HELPER_WIFI
+#include "esp_wifi.h"
+#endif
 
 #ifdef CONFIG_IDF_TARGET_ESP32
 #define CHIP_NAME "ESP32"
@@ -29,11 +34,11 @@
 #define CHIP_NAME "ESP32-S2 Beta"
 #endif
 
-#ifndef UA_ARCHITECTURE_FREERTOSLWIP
-#error UA_ARCHITECTURE_FREERTOSLWIP needs to be defined
-#endif
-
 #include <open62541.h>
+
+#if !defined(UA_ARCHITECTURE_LWIP) || !defined(UA_ARCHITECTURE_FREERTOS)
+#error UA_ARCHITECTURE_LWIP and UA_ARCHITECTURE_FREERTOS need to be defined
+#endif
 
 #include <esp_task_wdt.h>
 #include <esp_sntp.h>
@@ -54,16 +59,16 @@ RTC_DATA_ATTR static int boot_count = 0;
 static UA_StatusCode
 UA_ServerConfig_setUriName(UA_ServerConfig *uaServerConfig, const char *uri, const char *name) {
     // delete pre-initialized values
-    UA_String_deleteMembers(&uaServerConfig->applicationDescription.applicationUri);
-    UA_LocalizedText_deleteMembers(&uaServerConfig->applicationDescription.applicationName);
+    UA_String_clear(&uaServerConfig->applicationDescription.applicationUri);
+    UA_LocalizedText_clear(&uaServerConfig->applicationDescription.applicationName);
 
     uaServerConfig->applicationDescription.applicationUri = UA_String_fromChars(uri);
     uaServerConfig->applicationDescription.applicationName.locale = UA_STRING_NULL;
     uaServerConfig->applicationDescription.applicationName.text = UA_String_fromChars(name);
 
     for (size_t i = 0; i < uaServerConfig->endpointsSize; i++) {
-        UA_String_deleteMembers(&uaServerConfig->endpoints[i].server.applicationUri);
-        UA_LocalizedText_deleteMembers(
+        UA_String_clear(&uaServerConfig->endpoints[i].server.applicationUri);
+        UA_LocalizedText_clear(
                 &uaServerConfig->endpoints[i].server.applicationName);
 
         UA_String_copy(&uaServerConfig->applicationDescription.applicationUri,
@@ -103,30 +108,21 @@ static void opcua_task(void *arg) {
     caps[1] = UA_String_fromChars("NA");
     config->mdnsConfig.serverCapabilities = caps;
 
-    // We need to set the default IP address for mDNS since internally it's not able to detect it.
-    tcpip_adapter_ip_info_t default_ip;
-    esp_err_t ret = tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &default_ip);
-    if ((ESP_OK == ret) && (default_ip.ip.addr != INADDR_ANY)) {
-        config->mdnsIpAddressListSize = 1;
-        config->mdnsIpAddressList = (uint32_t *)UA_malloc(sizeof(uint32_t)*config->mdnsIpAddressListSize);
-        memcpy(config->mdnsIpAddressList, &default_ip.ip.addr, sizeof(uint32_t));
-    } else {
-        ESP_LOGI(TAG_OPC, "Could not get default IP Address!");
-    }
     #endif
     UA_ServerConfig_setUriName(config, appUri, "open62541 ESP32 Demo");
 
     #ifndef CONFIG_ETHERNET_HELPER_CUSTOM_HOSTNAME
-        #ifndef ETHERNET_HELPER_STATIC_IP4
+        #ifndef CONFIG_ETHERNET_HELPER_STATIC_IP4
             #error You need to set a static IP or a custom hostname with menuconfig
         #else
-        UA_String str = UA_STRING(CONFIG_ETHERNET_HELPER_STATIC_IP4_ADDRESS);
+            #define UA_SERVER_HOSTNAME CONFIG_ETHERNET_HELPER_STATIC_IP4_ADDRESS
         #endif
     #else
-    UA_String str = UA_STRING(CONFIG_ETHERNET_HELPER_CUSTOM_HOSTNAME_STR);
+        #define UA_SERVER_HOSTNAME CONFIG_ETHERNET_HELPER_CUSTOM_HOSTNAME_STR
     #endif
-    UA_String_clear(&config->customHostname);
-    UA_String_copy(&str, &config->customHostname);
+    config->serverUrls = (UA_String *)UA_Array_new(1, &UA_TYPES[UA_TYPES_STRING]);
+    config->serverUrlsSize = 1;
+    config->serverUrls[0] = UA_STRING_ALLOC("opc.tcp://" UA_SERVER_HOSTNAME ":4840");
 
     printf("xPortGetFreeHeapSize before create = %d bytes\n", xPortGetFreeHeapSize());
 
@@ -168,10 +164,10 @@ void time_sync_notification_cb(struct timeval *tv)
 static void initialize_sntp(void)
 {
     ESP_LOGI(TAG, "Initializing SNTP");
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");
-    sntp_set_time_sync_notification_cb(time_sync_notification_cb);
-    sntp_init();
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    esp_sntp_init();
 }
 
 static bool obtain_time(void)
@@ -185,7 +181,7 @@ static bool obtain_time(void)
     memset(&timeinfo, 0, sizeof(struct tm));
     int retry = 0;
     const int retry_count = 10;
-    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry <= retry_count) {
+    while (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry <= retry_count) {
         ESP_LOGI(TAG, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
         vTaskDelay(2000 / portTICK_PERIOD_MS);
         ESP_ERROR_CHECK(esp_task_wdt_reset());
@@ -239,11 +235,11 @@ void app_main(void)
            (chip_info.features & CHIP_FEATURE_BT) ? "/BT" : "",
            (chip_info.features & CHIP_FEATURE_BLE) ? "/BLE" : "");
 
-    spi_flash_init();
-
     printf("silicon revision %d, ", chip_info.revision);
 
-    printf("%dMB %s flash\n", spi_flash_get_chip_size() / (1024 * 1024),
+    uint32_t flash_size = 0;
+    esp_flash_get_size(NULL, &flash_size);
+    printf("%dMB %s flash\n", (int)(flash_size / (1024 * 1024)),
            (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external");
 
     printf("Heap Info:\n");
@@ -259,10 +255,12 @@ void app_main(void)
     esp_netif_init();
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    ESP_ERROR_CHECK(esp_task_wdt_init(10, true));
-    // Remove idle tasks from watchdog
-    ESP_ERROR_CHECK(esp_task_wdt_delete(xTaskGetIdleTaskHandleForCPU(0)));
-    ESP_ERROR_CHECK(esp_task_wdt_delete(xTaskGetIdleTaskHandleForCPU(1)));
+    const esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = 10000,
+        .idle_core_mask = 0,
+        .trigger_panic = true,
+    };
+    ESP_ERROR_CHECK(esp_task_wdt_init(&wdt_config));
 
     /* Register event handlers to stop the server when Wi-Fi or Ethernet is disconnected,
      * and re-start it upon connection.

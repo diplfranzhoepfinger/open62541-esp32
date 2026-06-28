@@ -1,4 +1,4 @@
 idf_component_register(SRCS "connect.c"
                     INCLUDE_DIRS "include"
-                       REQUIRES lwip mdns
+                       REQUIRES lwip mdns esp_wifi esp_eth
                        )
