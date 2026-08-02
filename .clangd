@@ -1,0 +1,3 @@
+CompileFlags:
+  CompilationDatabase: /home/franz/git/franz/open62541-esp32/build
+  Remove: [-m*, -f*]
