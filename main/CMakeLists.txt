@@ -1,6 +1,6 @@
 
-idf_component_register(SRCS "main.c"
-                       REQUIRES open62541 ethernet_helper nvs_flash esp_adc spi_flash)
+idf_component_register(SRCS "main.c" "ws_connection_manager.c"
+                       REQUIRES open62541 ethernet_helper nvs_flash esp_adc spi_flash espressif__mdns esp_http_server)
 
 # Build static library, do not build test executables
 option(BUILD_SHARED_LIBS OFF)

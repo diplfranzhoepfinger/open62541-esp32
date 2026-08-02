@@ -38,7 +38,11 @@ set(open62541_OPTIONS
     "-DUA_ENABLE_XML_ENCODING=OFF"
     "-DUA_ENABLE_STATUSCODE_DESCRIPTIONS=OFF"
     "-DUA_ENABLE_DISCOVERY=ON"
-    "-DUA_ENABLE_DISCOVERY_MULTICAST=MDNSD"
+    # Generic server-side opc.ws:// wiring (src/server/ua_server_ws.c). We
+    # provide our own "websocket" UA_ConnectionManager built on ESP-IDF's
+    # esp_http_server instead of the POSIX-only, libwebsockets-based one
+    # (UA_ENABLE_LWS) that open62541 ships internally.
+    "-DUA_ENABLE_WEBSOCKET_TRANSPORT=ON"
     "-DUA_LOGLEVEL=300"
     "-DUA_ENABLE_NODESET_COMPILER_DESCRIPTIONS=OFF"
     "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"

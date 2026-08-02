@@ -34,6 +34,10 @@
 #define CHIP_NAME "ESP32-S2 Beta"
 #endif
 
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+#define CHIP_NAME "ESP32-S3"
+#endif
+
 #include <open62541.h>
 
 #if !defined(UA_ARCHITECTURE_LWIP) || !defined(UA_ARCHITECTURE_FREERTOS)
@@ -42,8 +46,14 @@
 
 #include <esp_task_wdt.h>
 #include <esp_sntp.h>
+#include <mdns.h>
+
+#include "ws_connection_manager.h"
 
 #define ENABLE_MDNS
+#define OPCUA_WS_PORT 4841
+#define STRINGIFY_HELPER(x) #x
+#define STRINGIFY(x) STRINGIFY_HELPER(x)
 
 static const char *TAG = "MAIN";
 static const char *TAG_OPC = "OPC UA";
@@ -99,17 +109,6 @@ static void opcua_task(void *arg) {
     UA_ServerConfig_setMinimalCustomBuffer(config, 4840, 0, sendBufferSize, recvBufferSize);
 
     const char* appUri = "open62541.esp32.demo";
-    #ifdef ENABLE_MDNS
-    config->mdnsEnabled = true;
-    config->mdnsConfig.mdnsServerName = UA_String_fromChars(appUri);
-    config->mdnsConfig.serverCapabilitiesSize = 2;
-    UA_String *caps = (UA_String *) UA_Array_new(2, &UA_TYPES[UA_TYPES_STRING]);
-    caps[0] = UA_String_fromChars("LDS");
-    caps[1] = UA_String_fromChars("NA");
-    config->mdnsConfig.serverCapabilities = caps;
-
-    #endif
-    UA_ServerConfig_setUriName(config, appUri, "open62541 ESP32 Demo");
 
     #ifndef CONFIG_ETHERNET_HELPER_CUSTOM_HOSTNAME
         #ifndef CONFIG_ETHERNET_HELPER_STATIC_IP4
@@ -120,9 +119,79 @@ static void opcua_task(void *arg) {
     #else
         #define UA_SERVER_HOSTNAME CONFIG_ETHERNET_HELPER_CUSTOM_HOSTNAME_STR
     #endif
-    config->serverUrls = (UA_String *)UA_Array_new(1, &UA_TYPES[UA_TYPES_STRING]);
-    config->serverUrlsSize = 1;
+
+    #ifdef ENABLE_MDNS
+    #ifdef UA_ARCHITECTURE_POSIX
+    /* open62541's own mdnsd discovery driver (requires UA_ARCHITECTURE=posix) */
+    config->serversOnNetworkEnabled = true;
+    {
+        UA_Boolean mdnsEnabledFlag = true;
+        UA_KeyValuePair mdnsParams[2];
+        mdnsParams[0].key = UA_QUALIFIEDNAME(0, "listen");
+        UA_Variant_setScalar(&mdnsParams[0].value, &mdnsEnabledFlag, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        mdnsParams[1].key = UA_QUALIFIEDNAME(0, "announce");
+        UA_Variant_setScalar(&mdnsParams[1].value, &mdnsEnabledFlag, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        UA_KeyValueMap mdnsParamsMap = {2, mdnsParams};
+
+        UA_MdnsDriver *mdnsDriver = UA_MdnsDriver_Mdnsd(mdnsParamsMap);
+        if (mdnsDriver) {
+            UA_StatusCode mdnsRetval = UA_Server_addDriver(server, &mdnsDriver->drv);
+            if (mdnsRetval != UA_STATUSCODE_GOOD) {
+                ESP_LOGE(TAG_OPC, "Could not add mDNS discovery driver: %s", UA_StatusCode_name(mdnsRetval));
+                mdnsDriver->drv.free(&mdnsDriver->drv);
+            }
+        } else {
+            ESP_LOGE(TAG_OPC, "Could not create mDNS discovery driver");
+        }
+    }
+    #else
+    /* Non-POSIX (freertos-lwip): open62541's bundled mdnsd driver requires
+     * UA_ARCHITECTURE=posix, so announce the server via ESP-IDF's own mDNS
+     * component (managed_components/espressif__mdns) instead. */
+    {
+        esp_err_t mdnsErr = mdns_init();
+        if (mdnsErr == ESP_OK) {
+            mdns_hostname_set(UA_SERVER_HOSTNAME);
+            mdns_instance_name_set("open62541 ESP32 Demo");
+            mdnsErr = mdns_service_add(NULL, "_opcua-tcp", "_tcp", 4840, NULL, 0);
+            if (mdnsErr != ESP_OK) {
+                ESP_LOGE(TAG_OPC, "Could not add mDNS service: %s", esp_err_to_name(mdnsErr));
+            }
+        } else {
+            ESP_LOGE(TAG_OPC, "Could not initialize mDNS: %s", esp_err_to_name(mdnsErr));
+        }
+    }
+    #endif
+    #endif
+
+    UA_ServerConfig_setUriName(config, appUri, "open62541 ESP32 Demo");
+
+    /* opc.ws:// support: open62541's own WebSocket ConnectionManager requires
+     * libwebsockets + UA_ARCHITECTURE=posix, unavailable on freertos-lwip.
+     * Register our own ConnectionManager (built on esp_http_server) with the
+     * EventLoop instead; UA_ENABLE_WEBSOCKET_TRANSPORT wires the generic
+     * server-side opc.ws:// handling to whatever ConnectionManager is found
+     * there under the "websocket" protocol name. */
+    UA_ConnectionManager *wsConnectionManager = WsConnectionManager_new();
+    if (wsConnectionManager) {
+        UA_StatusCode wsRetval = config->eventLoop->registerEventSource(
+                config->eventLoop, &wsConnectionManager->eventSource);
+        if (wsRetval != UA_STATUSCODE_GOOD) {
+            ESP_LOGE(TAG_OPC, "Could not register the WebSocket ConnectionManager: %s",
+                     UA_StatusCode_name(wsRetval));
+            wsConnectionManager->eventSource.free(&wsConnectionManager->eventSource);
+            wsConnectionManager = NULL;
+        } else {
+            config->webSocketEnabled = true;
+        }
+    } else {
+        ESP_LOGE(TAG_OPC, "Could not create the WebSocket ConnectionManager");
+    }
+
+    config->serverUrls = (UA_String *)UA_Array_new(2, &UA_TYPES[UA_TYPES_STRING]);
+    config->serverUrlsSize = 2;
     config->serverUrls[0] = UA_STRING_ALLOC("opc.tcp://" UA_SERVER_HOSTNAME ":4840");
+    config->serverUrls[1] = UA_STRING_ALLOC("opc.ws://" UA_SERVER_HOSTNAME ":" STRINGIFY(OPCUA_WS_PORT));
 
     printf("xPortGetFreeHeapSize before create = %d bytes\n", xPortGetFreeHeapSize());
 
@@ -136,6 +205,8 @@ static void opcua_task(void *arg) {
 
     while (true) {
         UA_Server_run_iterate(server, false);
+        if (wsConnectionManager)
+            WsConnectionManager_poll(wsConnectionManager);
         ESP_ERROR_CHECK(esp_task_wdt_reset());
         taskYIELD();
     }
